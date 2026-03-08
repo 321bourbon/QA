@@ -4,8 +4,11 @@ from pathlib import Path
 
 from api.gpt_api import VLM
 from utils.logger import setup_runtime_logger, shutdown_runtime_logger
-from utils.utils import extract_result, get_normality_definition, parse_questions, save_main_questions
-from api.vlm_prompts import p_describe, p_gen_mainq, p_summarize, p_test
+from utils.utils import (
+    extract_result, get_normality_definition, parse_questions,
+    parse_sub_questions, save_main_questions, save_sub_questions,
+)
+from api.vlm_prompts import p_describe, p_gen_mainq, p_gen_subq, p_summarize, p_test
 
 
 def _env_list(name, default):
@@ -22,9 +25,11 @@ CONFIG = {
     "model": os.environ.get("LOGICQA_MODEL", "gpt-4o"),  # Appendix B.1
     "temperature": 1.0,  # Appendix B.1
     "max_new_tokens": None,  # GPT-4o default
-    "normal_shot": 3,  # Section 5.1
-    "mainq_acc_threshold": 0.8,  # Section 3.4
-    "filter_shot": 5,  # 50
+    # ── 成本简化开关（论文值见注释，按需恢复）──
+    "normal_shot": 3,             # 论文 = 3（Section 5.1）；不建议修改
+    "mainq_acc_threshold": 0.8,   # 论文 = 0.8（Section 3.4）；不建议修改
+    "filter_shot": 5,             # 论文 = 50；数量越大过滤越稳定，成本越高
+    "subq_num": 5,                # 论文 = 5（Section 3.5）；不建议修改
     "seed": 42,
     "class_list": _env_list(
         "LOGICQA_CLASSES",
@@ -141,6 +146,19 @@ def main():
             if final_qs:
                 save_main_questions(class_name, final_qs)
                 print(f"  final_main_questions: {len(final_qs)}")
+
+                # ── Stage 5: Generate and cache Sub-Questions ──
+                print("\n[Stage 5] Generate sub-questions for each Main-Q")
+                sub_q_dict = {}
+                for q_idx, main_q in enumerate(final_qs):
+                    prompt = p_gen_subq(main_q)
+                    response, _ = vlm.ask("", prompt)
+                    sub_qs = parse_sub_questions(
+                        response, fallback_q=main_q, subq_num=CONFIG["subq_num"]
+                    )
+                    sub_q_dict[q_idx] = sub_qs
+                    print(f"  Main-Q{q_idx + 1}: {len(sub_qs)} sub-Qs generated")
+                save_sub_questions(class_name, sub_q_dict)
             else:
                 print("  all questions filtered out")
 

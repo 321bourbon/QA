@@ -6,11 +6,14 @@ from datetime import datetime
 from pathlib import Path
 from statistics import median
 
-from PIL import Image, ImageOps
+from PIL import Image
 
 from api.gpt_api import APIQuotaExceededError, VLM
 from utils.logger import setup_runtime_logger, shutdown_runtime_logger
-from utils.utils import extract_result, load_main_questions
+from utils.utils import (
+    extract_result, load_main_questions,
+    load_sub_questions, save_sub_questions, parse_sub_questions,
+)
 from api.vlm_prompts import p_gen_subq, p_test
 
 
@@ -28,14 +31,14 @@ CONFIG = {
     "model": os.environ.get("LOGICQA_MODEL", "gpt-4o"),  # Appendix B.1
     "temperature": 1.0,  # Appendix B.1
     "max_new_tokens": None,  # GPT-4o default
-    "subq_num": 5,  # Section 3.5
+    "subq_num": 5,                # 论文 = 5（Section 3.5）；不建议修改
     "results_dir": os.environ.get("LOGICQA_RESULTS_DIR", "./test_results"),
-    "max_good_images_per_class": 10,  # 10
-    "max_images_per_class": 0,  # 0 = no limit
-    "segment_policy": "largest",  # largest
-    "max_segments_per_query": 1,  # 1
-    "segment_tile_size": 320,  # 320
-    "segment_cache_dir": "./runtime_logs/segment_montage_cache",
+    # ── 成本简化开关（论文值见注释，按需恢复）──
+    "max_good_images_per_class": 10,   # 论文 = 0（全量）；0 = 不限制，成本高
+    "max_images_per_class": 0,         # 0 = 不限制（anomaly 侧已是全量）
+    # segment 策略（0 = 全部片段逐一轮询，N = 最多 N 片）
+    # 论文正确行为 = 0（全部）；成本缩减时可设为 1
+    "max_segments_per_query": 0,       # 论文 = 全部（Section 4 & Appendix F）
     "class_list": _env_list(
         "LOGICQA_CLASSES",
         ["breakfast_box", "juice_bottle", "pushpins", "screw_bag", "splicing_connectors"],
@@ -48,80 +51,6 @@ def _parse_segment_name(path_obj):
     if m:
         return m.group(1), int(m.group(2))
     return path_obj.stem, None
-
-
-def _pick_largest(paths):
-    best = None
-    best_area = -1
-    for p in paths:
-        try:
-            with Image.open(p) as im:
-                area = im.size[0] * im.size[1]
-            if area > best_area:
-                best_area = area
-                best = p
-        except Exception:
-            continue
-    return best or paths[0]
-
-
-def _build_segment_query_image(paths, class_name, subset_name, base_name):
-    if len(paths) <= 1:
-        return str(paths[0])
-
-    policy = CONFIG["segment_policy"].lower()
-    if policy == "first":
-        return str(paths[0])
-    if policy == "largest":
-        return str(_pick_largest(paths))
-
-    max_seg = max(1, CONFIG["max_segments_per_query"])
-    tile = max(64, CONFIG["segment_tile_size"])
-    selected = paths[:max_seg]
-    out_dir = Path(CONFIG["segment_cache_dir"]) / class_name / subset_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{base_name}_montage.jpg"
-
-    if out_path.exists():
-        return str(out_path)
-
-    images = []
-    for p in selected:
-        try:
-            with Image.open(p) as im:
-                images.append(im.convert("RGB").copy())
-        except Exception:
-            continue
-    if not images:
-        return str(paths[0])
-
-    cols = 1 if len(images) == 1 else 2
-    rows = (len(images) + cols - 1) // cols
-    canvas = Image.new("RGB", (cols * tile, rows * tile), (0, 0, 0))
-    for idx, im in enumerate(images):
-        tile_img = ImageOps.pad(im, (tile, tile), color=(0, 0, 0))
-        x = (idx % cols) * tile
-        y = (idx // cols) * tile
-        canvas.paste(tile_img, (x, y))
-
-    canvas.save(out_path, quality=95)
-    return str(out_path)
-
-
-def _select_segment_query(seg_paths, class_name, subset_name, base_name):
-    policy = CONFIG["segment_policy"].lower()
-    if policy == "first":
-        chosen = seg_paths[0]
-        display = f"{base_name}.png (seg=first -> {chosen.name})"
-        return str(chosen), display
-    if policy == "largest":
-        chosen = _pick_largest(seg_paths)
-        display = f"{base_name}.png (seg=largest -> {Path(chosen).name})"
-        return str(chosen), display
-
-    montage = _build_segment_query_image(seg_paths, class_name, subset_name, base_name)
-    display = f"{base_name}.png (seg=montage {min(len(seg_paths), max(1, CONFIG['max_segments_per_query']))}/{len(seg_paths)})"
-    return montage, display
 
 
 def load_test_images(class_name):
@@ -151,13 +80,16 @@ def load_test_images(class_name):
 
         for base, rec in groups.items():
             if rec["seg"]:
-                seg_paths = [p for _, p in sorted(rec["seg"], key=lambda x: x[0])]
-                query_path, display_name = _select_segment_query(seg_paths, class_name, sub.name, base)
+                seg_paths = [str(p) for _, p in sorted(rec["seg"], key=lambda x: x[0])]
+                # 按 max_segments_per_query 限制数量（0 = 全部）
+                max_seg = CONFIG["max_segments_per_query"]
+                if max_seg > 0:
+                    seg_paths = seg_paths[:max_seg]
+                display_name = f"{base}.png ({len(seg_paths)} segs)"
             else:
-                raw_paths = sorted(rec["raw"])
-                query_path = str(raw_paths[0])
-                display_name = Path(query_path).name
-            bucket.append((query_path, label, sub.name, display_name))
+                seg_paths = [str(sorted(rec["raw"])[0])]
+                display_name = Path(seg_paths[0]).name
+            bucket.append((seg_paths, label, sub.name, display_name))
 
     if CONFIG["max_good_images_per_class"] > 0:
         good_images = good_images[: CONFIG["max_good_images_per_class"]]
@@ -168,60 +100,39 @@ def load_test_images(class_name):
     return images
 
 
-def parse_sub_questions(response, fallback_q):
-    if not response.strip():
-        return [fallback_q] * CONFIG["subq_num"]
+def generate_sub_questions(vlm, class_name, main_questions):
+    """
+    先尝试加载缓存；若缓存存在且 Main-Q 数量匹配，直接复用。
+    否则实时生成并立即保存缓存，保证实验可复现。
+    """
+    cached = load_sub_questions(class_name)
+    if cached is not None and len(cached) == len(main_questions):
+        print(f"\n[Sub-Q] loaded from cache ({len(cached)} main-Qs)")
+        return cached
 
-    out = []
-    for raw in response.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        line = re.sub(r"^Output\s*\d+\s*[:.]\s*", "", line, flags=re.IGNORECASE)
-        line = re.sub(r"^\d+\s*[.)]\s*", "", line)
-        line = re.sub(r"^[-*]\s*", "", line)
-        if len(line.split()) < 4:
-            continue
-        if not line.endswith("?"):
-            line = line.rstrip(" .;:") + "?"
-        out.append(line)
-
-    deduped = []
-    seen = set()
-    for q in out:
-        key = q.lower()
-        if key not in seen:
-            seen.add(key)
-            deduped.append(q)
-    if not deduped:
-        deduped = [fallback_q]
-    while len(deduped) < CONFIG["subq_num"]:
-        deduped.append(fallback_q)
-    return deduped[: CONFIG["subq_num"]]
-
-
-def generate_sub_questions(vlm, main_questions):
+    print(f"\n[Sub-Q] cache miss, generating for {class_name} ...")
     all_sub_q = {}
-    print("\n[Sub-Q generation]")
     for i, main_q in enumerate(main_questions):
         prompt = p_gen_subq(main_q)
         response, _ = vlm.ask("", prompt)
-        sub_qs = parse_sub_questions(response, main_q)
+        sub_qs = parse_sub_questions(response, fallback_q=main_q, subq_num=CONFIG["subq_num"])
         all_sub_q[i] = sub_qs
-        print(f"  Main-Q{i + 1}: {len(sub_qs)} Sub-Q generated")
+        print(f"  Main-Q{i + 1}: {len(sub_qs)} Sub-Qs generated")
+    save_sub_questions(class_name, all_sub_q)
     return all_sub_q
 
 
-def test_single_image(vlm, image_path, class_name, main_questions, sub_questions, image_display_name=None):
+def _test_one_segment(vlm, image_path, class_name, main_questions, sub_questions, image_display_name=None):
+    """对单个 segment 图像执行所有 Main-Q 的 Sub-Q 投票，返回该 segment 的结果字典。"""
     main_q_results = []
-    main_q_logprobs = []
+    main_q_logprobs = []  # 元素可为 float 或 None（logprob 不可用时）
     display_name = image_display_name or os.path.basename(image_path)
     segment_name = os.path.basename(image_path)
 
     for i, main_q in enumerate(main_questions):
         sub_qs = sub_questions.get(i, [main_q] * CONFIG["subq_num"])
         sub_answers = []
-        sub_logprobs = []
+        sub_logprobs = []  # 元素可为 float 或 None
         print(f"\n    MainQ {i + 1}/{len(main_questions)}: {main_q}")
 
         for j, sub_q in enumerate(sub_qs, 1):
@@ -231,32 +142,43 @@ def test_single_image(vlm, image_path, class_name, main_questions, sub_questions
                 result_text = extract_result(response)
                 q_ij = 0 if result_text == "Yes" else 1
                 sub_answers.append(q_ij)
-                lp = logprob if logprob is not None else -2.0
-                sub_logprobs.append(lp)
+                sub_logprobs.append(logprob)  # None 时保持 None，不用 -2.0 回退
+                lp_display = f"{logprob:.4f}" if logprob is not None else "N/A"
                 print(
                     f"      M{i + 1}-S{j} [{display_name} | seg={segment_name}] "
-                    f"Result={result_text} logprob={lp:.4f}"
+                    f"Result={result_text} logprob={lp_display}"
                 )
             except APIQuotaExceededError:
                 raise
             except Exception as e:
-                print(f"    warn: ask1 failed on sub-question, fallback to 'No' ({e})")
-                sub_answers.append(1)
-                sub_logprobs.append(-2.0)
+                print(f"    warn: ask1 failed on sub-question, sub-q skipped ({e})")
+                sub_answers.append(1)    # 失败时保守判 No
+                sub_logprobs.append(None)  # logprob 未知，标为 None
                 print(
                     f"      M{i + 1}-S{j} [{display_name} | seg={segment_name}] "
-                    f"Result=No logprob=-2.0000"
+                    f"Result=No logprob=N/A"
                 )
 
         Q_i = 0 if sub_answers.count(0) > sub_answers.count(1) else 1
         main_q_results.append(Q_i)
-        matching = [sub_logprobs[j] for j in range(len(sub_answers)) if sub_answers[j] == Q_i]
-        main_q_logprobs.append(max(matching) if matching else -2.0)
+        # 仅收集与投票结果一致且 logprob 不为 None 的有效值
+        matching_lps = [
+            sub_logprobs[j]
+            for j in range(len(sub_answers))
+            if sub_answers[j] == Q_i and sub_logprobs[j] is not None
+        ]
+        main_q_logprobs.append(max(matching_lps) if matching_lps else None)
 
     prediction = "Normal" if sum(main_q_results) == 0 else "Anomaly"
 
-    S = [math.exp(s_i) for s_i in main_q_logprobs]
-    med = median(S) if S else 0.5
+    # Section 5.2：过滤掉 None 后再计算 S 和中位数
+    valid_lps = [lp for lp in main_q_logprobs if lp is not None]
+    if valid_lps:
+        S = [math.exp(lp) for lp in valid_lps]
+        med = median(S)
+    else:
+        # 极端情况：全部 logprob 缺失，回退到 binary score
+        med = 0.5
     anomaly_score = (1.0 - med) if prediction == "Normal" else med
 
     triggered = [main_questions[i] for i, q in enumerate(main_q_results) if q == 1]
@@ -266,6 +188,57 @@ def test_single_image(vlm, image_path, class_name, main_questions, sub_questions
         "main_q_results": main_q_results,
         "main_q_logprobs": main_q_logprobs,
         "triggered_questions": triggered,
+    }
+
+
+def test_single_image_multi_seg(vlm, segment_paths, class_name, main_questions, sub_questions, image_display_name=None):
+    """
+    逐片轮询策略 — 论文 Section 4 & Appendix F 正确实现。
+    segment_paths: list[str]，该图像对应的所有 segment 路径（无分割则长度为 1）。
+    任一 segment 的任一 Main-Q 为 No → 整图判 Anomaly。
+    Anomaly Score 取所有 segment 的最大值（最可疑片段代表整图）。
+    """
+    if len(segment_paths) == 1:
+        return _test_one_segment(
+            vlm, segment_paths[0], class_name,
+            main_questions, sub_questions, image_display_name
+        )
+
+    # ── 多 segment 逐一推理 ──
+    all_seg_results = []
+    for seg_idx, seg_path in enumerate(segment_paths):
+        seg_display = f"{image_display_name}_seg{seg_idx + 1}"
+        print(f"\n    [segment {seg_idx + 1}/{len(segment_paths)}] {os.path.basename(seg_path)}")
+        seg_result = _test_one_segment(
+            vlm, seg_path, class_name,
+            main_questions, sub_questions, seg_display
+        )
+        all_seg_results.append(seg_result)
+
+    # 任一 segment 触发 anomaly → 整图 Anomaly
+    any_anomaly = any(r["prediction"] == "Anomaly" for r in all_seg_results)
+    prediction = "Anomaly" if any_anomaly else "Normal"
+
+    # 取所有 segment 的最大 anomaly_score
+    anomaly_score = max(r["anomaly_score"] for r in all_seg_results)
+
+    # 合并所有 segment 触发的 Main-Q（去重）
+    triggered = []
+    seen_q = set()
+    for r in all_seg_results:
+        for q in r["triggered_questions"]:
+            if q not in seen_q:
+                seen_q.add(q)
+                triggered.append(q)
+
+    return {
+        "prediction": prediction,
+        "anomaly_score": anomaly_score,
+        "main_q_results": all_seg_results[0]["main_q_results"],  # 首片供日志参考
+        "main_q_logprobs": all_seg_results[0]["main_q_logprobs"],
+        "triggered_questions": triggered,
+        "num_segments": len(segment_paths),
+        "per_segment_results": all_seg_results,
     }
 
 
@@ -327,21 +300,17 @@ def test_class(vlm, class_name, main_questions):
     print(f"  anomaly: {sum(1 for t in test_images if t[1] == 1)}")
     print(f"  main questions: {len(main_questions)}")
 
-    sub_questions = generate_sub_questions(vlm, main_questions)
+    sub_questions = generate_sub_questions(vlm, class_name, main_questions)
 
     results = []
     for idx, item in enumerate(test_images, 1):
-        if len(item) == 4:
-            img_path, label, subfolder, display_name = item
-        else:
-            img_path, label, subfolder = item
-            display_name = os.path.basename(img_path)
+        seg_paths, label, subfolder, display_name = item
 
         print(f"\n  [{idx}/{len(test_images)}] {display_name}")
         try:
-            result = test_single_image(
+            result = test_single_image_multi_seg(
                 vlm,
-                img_path,
+                seg_paths,
                 class_name,
                 main_questions,
                 sub_questions,
@@ -368,7 +337,7 @@ def test_class(vlm, class_name, main_questions):
                 "error": str(e),
             }
 
-        result["image_path"] = img_path
+        result["image_path"] = seg_paths[0]
         result["display_name"] = display_name
         result["true_label"] = label
         result["subfolder"] = subfolder
@@ -491,8 +460,7 @@ def main():
         print(f"config.class_list: {CONFIG['class_list']}")
         print(f"config.max_good_images_per_class: {CONFIG['max_good_images_per_class']}")
         print(f"config.max_images_per_class: {CONFIG['max_images_per_class']}")
-        print(f"config.segment_policy: {CONFIG['segment_policy']}")
-        print(f"config.max_segments_per_query: {CONFIG['max_segments_per_query']}")
+        print(f"config.max_segments_per_query: {CONFIG['max_segments_per_query']} (0=all)")
 
         vlm = VLM(CONFIG)
         class_list = CONFIG["class_list"]

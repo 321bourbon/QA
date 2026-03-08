@@ -51,7 +51,8 @@ class VLM:
 
         self.model = self.cfg.get("model", "mock-gemini-2.5-flash" if self.mock_mode else "gemini-2.5-flash")
         self.temperature = self.cfg.get("temperature", 1.0)
-        self.top_p = self.cfg.get("top_p")
+        self.top_p  = self.cfg.get("top_p",  None)   # 论文 Appendix B.1 = 0.95
+        self.top_k  = self.cfg.get("top_k",  None)   # 论文 Appendix B.1 = 40
         self.max_tokens = self.cfg.get("max_new_tokens")
 
         shared_log = os.environ.get("LOGICQA_LOG_PATH", "").strip()
@@ -71,6 +72,7 @@ class VLM:
         self._log(f"  model: {self.model}")
         self._log(f"  temperature: {self.temperature}")
         self._log(f"  top_p: {self.top_p if self.top_p is not None else 'default'}")
+        self._log(f"  top_k: {self.top_k if self.top_k is not None else 'default'}")
         self._log(f"  max_tokens: {self.max_tokens if self.max_tokens is not None else 'default'}")
         self._log(f"  log_file: {self.log_path}")
         self._log("=" * 78)
@@ -101,6 +103,8 @@ class VLM:
         kwargs = {"temperature": self.temperature}
         if self.top_p is not None:
             kwargs["top_p"] = self.top_p
+        if self.top_k is not None:
+            kwargs["top_k"] = self.top_k
         if self.max_tokens is not None:
             kwargs["max_output_tokens"] = self.max_tokens
         if with_logprobs:
@@ -361,7 +365,9 @@ if __name__ == "__main__":
             demo_cfg = {
                 "mode": "model" if is_mock else "api",
                 "model": "mock-gemini-2.5-flash" if is_mock else "gemini-2.5-flash",
-                "temperature": 1.0,
+                "temperature": 1.0,   # Appendix B.1
+                "top_p": 0.95,        # Appendix B.1
+                "top_k": 40,          # Appendix B.1
             }
             vlm = VLM(demo_cfg)
 

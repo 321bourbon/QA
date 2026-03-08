@@ -6,6 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torchvision.transforms as transforms
 from PIL import Image
 
 
@@ -22,6 +23,11 @@ CONFIG = {
     ],
     # Paper Appendix F:
     "bpm_classes": {"screw_bag", "splicing_connectors"},
+    # BPM ViT 参数（论文使用 DINO ViT-S/16，Figure 3 & Appendix F）
+    "bpm_vit_model":      "dino_vits16",
+    "bpm_input_size":     480,
+    "bpm_patch_size":     16,
+    "bpm_attn_threshold": 60,   # 百分位，越高前景越保守
     # Paper Appendix B.3:
     "lang_sam_prompts": {
         "splicing_connectors": "Connector Block",
@@ -35,31 +41,97 @@ def iter_images(folder):
 
 
 class BPMProcessor:
-    """Lightweight object-centered crop for BPM-like preprocessing."""
+    """
+    Back Patch Masking (BPM) — 论文 Figure 3 & Appendix F 实现。
+    使用预训练 DINO ViT 的 CLS token 注意力图，将低注意力区域（背景）置零，
+    保留前景物体像素。
+    步骤：
+      1. 将原图 resize 到 ViT 输入尺寸 (bpm_input_size)
+      2. 用 DINO ViT 获取所有 head 的 CLS 注意力图
+      3. 对多 head 取平均 → [H_patch, W_patch]
+      4. Resize 注意力图到原图尺寸
+      5. 二值化：高于第 bpm_attn_threshold 百分位的像素为前景
+      6. 用掩码置零背景像素，保存结果
+    """
 
-    # Class-specific rough crop (x1, y1, x2, y2) ratio
-    CROP = {
-        "screw_bag": (0.10, 0.10, 0.90, 0.90),
-        "splicing_connectors": (0.10, 0.10, 0.90, 0.90),
-    }
+    def __init__(self):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = None
+        self._transform = None
+        self._load_vit()
+
+    def _load_vit(self):
+        vit_model = CONFIG["bpm_vit_model"]
+        input_size = CONFIG["bpm_input_size"]
+        try:
+            print(f"[BPM] loading DINO ViT: {vit_model}")
+            self.model = torch.hub.load(
+                "facebookresearch/dino:main", vit_model, pretrained=True
+            )
+            self.model.eval().to(self.device)
+            self._transform = transforms.Compose([
+                transforms.Resize((input_size, input_size)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ])
+            print(f"[BPM] ViT ready on {self.device}")
+        except Exception as e:
+            print(f"[BPM] ViT load failed: {e}  -> will use fallback center crop")
+            self.model = None
+
+    def _get_attention_mask(self, pil_image) -> np.ndarray:
+        """返回与原图同尺寸的 float32 mask，前景≈1，背景≈0。"""
+        w_orig, h_orig = pil_image.size
+        tensor = self._transform(pil_image).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            attn = self.model.get_last_selfattention(tensor)  # [1, nh, N+1, N+1]
+        # CLS token (index 0) 对所有 patch 的注意力，多 head 平均
+        attn_cls = attn[0, :, 0, 1:]           # [nh, N_patches]
+        attn_mean = attn_cls.mean(dim=0)        # [N_patches]
+        # reshape 到 patch grid
+        patch_size = CONFIG["bpm_patch_size"]
+        input_size = CONFIG["bpm_input_size"]
+        h_p = w_p = input_size // patch_size
+        attn_map = attn_mean.reshape(h_p, w_p).cpu().numpy()
+        # resize 到原图尺寸
+        attn_full = cv2.resize(attn_map, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
+        # 二值化
+        threshold = np.percentile(attn_full, CONFIG["bpm_attn_threshold"])
+        binary_mask = (attn_full >= threshold).astype(np.float32)
+        return binary_mask
+
+    @staticmethod
+    def _fallback_center_crop(image_np, ratio=0.9):
+        h, w = image_np.shape[:2]
+        nw, nh = int(w * ratio), int(h * ratio)
+        x1 = (w - nw) // 2
+        y1 = (h - nh) // 2
+        return image_np[y1:y1 + nh, x1:x1 + nw]
 
     def process(self, image_path, class_name, output_path):
         if class_name not in CONFIG["bpm_classes"]:
             return False, f"skip (paper: BPM not used for {class_name})"
 
-        img = cv2.imread(image_path)
-        if img is None:
-            return False, "read failed"
-
-        h, w = img.shape[:2]
-        x1r, y1r, x2r, y2r = self.CROP[class_name]
-        x1, y1 = int(w * x1r), int(h * y1r)
-        x2, y2 = int(w * x2r), int(h * y2r)
-        crop = img[y1:y2, x1:x2]
-
+        pil_img = Image.open(image_path).convert("RGB")
+        img_np = np.array(pil_img, dtype=np.uint8)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        cv2.imwrite(output_path, crop)
-        return True, "ok"
+
+        if self.model is None:
+            # ViT 未加载时使用 center crop 作为 fallback
+            fallback = self._fallback_center_crop(img_np)
+            Image.fromarray(fallback).save(output_path)
+            return True, "fallback center crop (ViT unavailable)"
+
+        try:
+            mask = self._get_attention_mask(pil_img)          # [H, W] float32
+            masked = (img_np * mask[:, :, np.newaxis]).astype(np.uint8)
+            Image.fromarray(masked).save(output_path)
+            return True, "bpm-vit ok"
+        except Exception as e:
+            # ViT 推理失败时降级到 center crop
+            fallback = self._fallback_center_crop(img_np)
+            Image.fromarray(fallback).save(output_path)
+            return True, f"fallback center crop ({e})"
 
 
 class GroundedSAMProcessor:

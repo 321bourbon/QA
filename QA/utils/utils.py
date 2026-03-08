@@ -3,6 +3,37 @@ import re
 from pathlib import Path
 
 
+def parse_sub_questions(response: str, fallback_q: str, subq_num: int = 5) -> list:
+    """从 VLM 回复中解析 Sub-Q 列表，不足 subq_num 个时用 fallback_q 补齐。"""
+    if not response.strip():
+        return [fallback_q] * subq_num
+
+    out = []
+    for raw in response.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        line = re.sub(r"^Output\s*\d+\s*[:.]\s*", "", line, flags=re.IGNORECASE)
+        line = re.sub(r"^\d+\s*[.)]\s*", "", line)
+        line = re.sub(r"^[-*]\s*", "", line)
+        if len(line.split()) < 4:
+            continue
+        if not line.endswith("?"):
+            line = line.rstrip(" .;:") + "?"
+        out.append(line)
+
+    deduped, seen = [], set()
+    for q in out:
+        if q.lower() not in seen:
+            seen.add(q.lower())
+            deduped.append(q)
+    if not deduped:
+        deduped = [fallback_q]
+    while len(deduped) < subq_num:
+        deduped.append(fallback_q)
+    return deduped[:subq_num]
+
+
 def extract_result(text):
     """Extract final Yes/No from model response."""
     if not text:
@@ -80,6 +111,41 @@ def load_main_questions(class_name, save_dir="./saved_questions"):
         raise FileNotFoundError(f"Main questions file not found: {in_file}")
     with in_file.open("r", encoding="utf-8") as f:
         return json.load(f)["main_questions"]
+
+
+def save_sub_questions(class_name, sub_questions_dict, save_dir="./saved_questions"):
+    """
+    sub_questions_dict: dict[int, list[str]]
+        key   = Main-Q 索引 (0-based)
+        value = Sub-Q 字符串列表
+    保存为 {save_dir}/{class_name}_subq.json
+    """
+    save_path = Path(save_dir)
+    save_path.mkdir(exist_ok=True)
+    out_file = save_path / f"{class_name}_subq.json"
+    serializable = {str(k): v for k, v in sub_questions_dict.items()}
+    payload = {
+        "class_name":    class_name,
+        "num_main_q":    len(sub_questions_dict),
+        "sub_questions": serializable,
+    }
+    with out_file.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"  Saved sub-questions cache: {out_file}")
+    return out_file
+
+
+def load_sub_questions(class_name, save_dir="./saved_questions"):
+    """
+    返回 dict[int, list[str]]，key 恢复为 int。
+    文件不存在时返回 None。
+    """
+    in_file = Path(save_dir) / f"{class_name}_subq.json"
+    if not in_file.exists():
+        return None
+    with in_file.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {int(k): v for k, v in data["sub_questions"].items()}
 
 
 def get_normality_definition(class_name):
