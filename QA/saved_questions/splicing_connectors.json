@@ -1,8 +1,0 @@
-{
-  "class_name": "splicing_connectors",
-  "num_questions": 2,
-  "main_questions": [
-    "Is the main object count visually correct?",
-    "Is there any extra unexpected component?"
-  ]
-}

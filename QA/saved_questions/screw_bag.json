@@ -1,8 +1,0 @@
-{
-  "class_name": "screw_bag",
-  "num_questions": 2,
-  "main_questions": [
-    "Is there any missing required component?",
-    "Does the global layout look consistent with normal samples?"
-  ]
-}

@@ -1,9 +1,0 @@
-{
-  "class_name": "breakfast_box",
-  "num_questions": 3,
-  "main_questions": [
-    "Are key components arranged in expected positions?",
-    "Is there any missing required component?",
-    "Does the global layout look consistent with normal samples?"
-  ]
-}

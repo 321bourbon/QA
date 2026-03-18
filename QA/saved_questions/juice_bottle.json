@@ -1,9 +1,0 @@
-{
-  "class_name": "juice_bottle",
-  "num_questions": 3,
-  "main_questions": [
-    "Is the main object count visually correct?",
-    "Are key components arranged in expected positions?",
-    "Is there any extra unexpected component?"
-  ]
-}
